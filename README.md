@@ -1,6 +1,6 @@
-# hyper-evm-replay
+# HyperEVM sync
 
-Proof of concept to replay the entire HyperEVM. This should be enough to implement an archive node.
+Proof of concept to execute all transactions from genesis for the entire HyperEVM. This should be enough to implement an archive node.
 
 To replay, one can first sync all the historical blocks from s3, for example using
 
