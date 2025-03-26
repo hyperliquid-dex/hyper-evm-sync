@@ -1,107 +1,44 @@
-use alloy_consensus::{Transaction as _, TxType};
-use alloy_primitives::{Address, B256, Bytes, Log, U256, address, bytes};
+mod evm_map;
+mod types;
+
+use evm_map::*;
+use types::*;
+
+use alloy_consensus::Transaction as _;
+use alloy_primitives::{Address, B256, Bytes, U256, address, bytes};
 use anyhow::Result;
+use rayon::prelude::*;
 use reth_primitives::transaction::SignedTransaction;
 use reth_primitives::{Receipt, SealedBlock, Transaction};
-use revm::DatabaseCommit;
-use revm::db::AccountState;
-use revm::primitives::{
-    AccountInfo, BlobExcessGasAndPrice, BlockEnv, Bytecode, CfgEnv, CfgEnvWithHandlerCfg,
-    EnvWithHandlerCfg, HandlerCfg, ResultAndState, SpecId, TxEnv, keccak256,
-};
-use revm::{Evm, db::InMemoryDB};
-use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use revm::context::result::ResultAndState;
+use revm::context::{BlockEnv, CfgEnv, Evm, TxEnv};
+use revm::context_interface::block::BlobExcessGasAndPrice;
+use revm::database::{AccountState, InMemoryDB};
+use revm::handler::EthPrecompiles;
+use revm::handler::instructions::EthInstructions;
+use revm::primitives::hardfork::SpecId;
+use revm::primitives::{HashMap, keccak256};
+use revm::state::{Account, AccountInfo, Bytecode};
+use revm::{Context, DatabaseCommit, ExecuteEvm, MainContext};
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockAndReceipts {
-    block: EvmBlock,
-    receipts: Vec<LegacyReceipt>,
-    #[serde(default)]
-    system_txs: Vec<SystemTx>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum EvmBlock {
-    Reth115(SealedBlock),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyReceipt {
-    tx_type: LegacyTxType,
-    success: bool,
-    cumulative_gas_used: u64,
-    logs: Vec<Log>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum LegacyTxType {
-    Legacy = 0,
-    Eip2930 = 1,
-    Eip1559 = 2,
-    Eip4844 = 3,
-    Eip7702 = 4,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SystemTx {
-    tx: Transaction,
-    receipt: Option<LegacyReceipt>,
-}
-
-impl From<LegacyReceipt> for Receipt {
-    fn from(value: LegacyReceipt) -> Self {
-        let LegacyReceipt {
-            tx_type,
-            success,
-            cumulative_gas_used,
-            logs,
-        } = value;
-        let tx_type = match tx_type {
-            LegacyTxType::Legacy => TxType::Legacy,
-            LegacyTxType::Eip2930 => TxType::Eip2930,
-            LegacyTxType::Eip1559 => TxType::Eip1559,
-            LegacyTxType::Eip4844 => TxType::Eip4844,
-            LegacyTxType::Eip7702 => TxType::Eip7702,
-        };
-        Self {
-            tx_type,
-            success,
-            cumulative_gas_used,
-            logs,
-        }
-    }
-}
-
-fn process_dir_recursive(
-    dir_path: &PathBuf,
-    block_paths: &mut Vec<(usize, PathBuf)>,
-) -> Result<()> {
-    let entries = fs::read_dir(dir_path)?;
-    for entry in entries {
-        let path = entry?.path();
-        if path.is_dir() {
-            process_dir_recursive(&path, block_paths)?;
-        } else if path.is_file() && path.extension().is_none_or(|ext| ext == "rmp") {
-            if let Some(stem) = path.file_stem() {
-                if let Some(stem_str) = stem.to_str() {
-                    if let Ok(num) = stem_str.parse::<usize>() {
-                        block_paths.push((num, path));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+fn decompress(data: &[u8]) -> Result<Vec<u8>, lz4_flex::frame::Error> {
+    let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
 }
 
 fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
     let mut file = File::open(file_path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
+
+    let buffer = decompress(&buffer)?;
 
     let mut input: Vec<_> = rmp_serde::from_slice(&buffer)?;
     assert_eq!(input.len(), 1);
@@ -128,13 +65,13 @@ fn deploy_system_contract(
     deployed_bytecode: Bytes,
 ) {
     let bytecode_hash = keccak256(&deployed_bytecode);
-    let account = state.accounts.entry(contract_address).or_default();
+    let account = state.cache.accounts.entry(contract_address).or_default();
     let bytecode = Bytecode::new_raw(deployed_bytecode.clone());
     account.info.code_hash = bytecode.hash_slow();
     account.info.code = Some(bytecode.clone());
     account.storage.clear();
     account.account_state = AccountState::StorageCleared;
-    state.contracts.insert(bytecode_hash, bytecode);
+    state.cache.contracts.insert(bytecode_hash, bytecode);
 
     if contract_address == WHYPE_CONTRACT_ADDRESS {
         for (slot, value) in [
@@ -150,63 +87,184 @@ fn deploy_system_contract(
     }
 }
 
+fn fix_state_diff(
+    block_number: u64,
+    tx_index: usize,
+    is_system_tx: bool,
+    changes: &mut HashMap<Address, Account>,
+) {
+    // Improper self destructs
+    for (block_num, idx, is_system, address) in [
+        (
+            1467569,
+            0,
+            false,
+            address!("0x33f6fe38c55cb100ce27b3138e5d2d041648364f"),
+        ),
+        (
+            1467631,
+            0,
+            false,
+            address!("0x33f6fe38c55cb100ce27b3138e5d2d041648364f"),
+        ),
+        (
+            1499313,
+            2,
+            false,
+            address!("0xe27bfc0a812b38927ff646f24af9149f45deb550"),
+        ),
+        (
+            1499406,
+            0,
+            false,
+            address!("0xe27bfc0a812b38927ff646f24af9149f45deb550"),
+        ),
+        (
+            1499685,
+            0,
+            false,
+            address!("0xfee3932b75a87e86930668a6ab3ed43b404c8a30"),
+        ),
+        (
+            1514843,
+            0,
+            false,
+            address!("0x723e5fbbeed025772a91240fd0956a866a41a603"),
+        ),
+        (
+            1514936,
+            0,
+            false,
+            address!("0x723e5fbbeed025772a91240fd0956a866a41a603"),
+        ),
+        (
+            1530529,
+            2,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1530622,
+            2,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1530684,
+            3,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1530777,
+            3,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1530839,
+            2,
+            false,
+            address!("0x692a343fc401a7755f8fc2facf61af426adaf061"),
+        ),
+        (
+            1530901,
+            0,
+            false,
+            address!("0xfd9716f16596715ce765dabaee11787870e04b8a"),
+        ),
+        (
+            1530994,
+            3,
+            false,
+            address!("0xfd9716f16596715ce765dabaee11787870e04b8a"),
+        ),
+        (
+            1531056,
+            4,
+            false,
+            address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4"),
+        ),
+        (
+            1531149,
+            0,
+            false,
+            address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4"),
+        ),
+        (
+            1531211,
+            3,
+            false,
+            address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4"),
+        ),
+        (
+            1531366,
+            1,
+            false,
+            address!("0x9a90a517d27a9e60e454c96fefbbe94ff244ed6f"),
+        ),
+    ] {
+        if block_number == block_num && tx_index == idx && is_system_tx == is_system {
+            changes.remove(&address);
+        }
+    }
+}
+
 fn apply_tx(
     block: &SealedBlock,
     sender: Address,
     transaction: &Transaction,
+    tx_index: usize,
     is_system_tx: bool,
     mut cumulative_gas_used: u64,
     mut db: &mut InMemoryDB,
 ) -> Receipt {
-    let mut cfg = CfgEnvWithHandlerCfg::new(
-        CfgEnv::default().with_chain_id(CHAIN_ID),
-        HandlerCfg::new(SpecId::CANCUN),
-    );
+    let mut cfg = CfgEnv::new_with_spec(SpecId::CANCUN).with_chain_id(CHAIN_ID);
     let basefee = if is_system_tx {
         cfg.disable_eip3607 = true;
-        U256::ZERO
+        0
     } else {
-        U256::from(
-            block
-                .header()
-                .base_fee_per_gas
-                .map(U256::from)
-                .unwrap_or_default(),
-        )
+        block.header().base_fee_per_gas.unwrap_or_default()
     };
     let block_env = BlockEnv {
-        number: U256::from(block.header().number),
-        coinbase: Address::ZERO,
-        timestamp: U256::from(block.header().timestamp),
-        gas_limit: U256::from(block.header().gas_limit),
+        number: block.header().number,
+        beneficiary: Address::ZERO,
+        timestamp: block.header().timestamp,
+        gas_limit: block.header().gas_limit,
         basefee,
         blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(0, false)),
         difficulty: U256::ZERO,
         prevrandao: Some(B256::ZERO),
     };
     let tx_env = TxEnv {
+        tx_type: transaction.tx_type().into(),
         caller: sender,
         gas_limit: transaction.gas_limit(),
-        gas_price: U256::from(transaction.max_fee_per_gas()),
-        transact_to: transaction.kind(),
+        gas_price: transaction.max_fee_per_gas(),
+        kind: transaction.kind(),
         value: transaction.value(),
         data: transaction.input().clone(),
-        nonce: Some(transaction.nonce()),
+        nonce: transaction.nonce(),
         chain_id: transaction.chain_id(),
-        access_list: transaction
-            .access_list()
-            .map_or_else(Vec::new, |access_list| access_list.0.clone()),
-        gas_priority_fee: transaction.max_priority_fee_per_gas().map(U256::from),
+        access_list: transaction.access_list().cloned().unwrap_or_default(),
+        gas_priority_fee: transaction.max_priority_fee_per_gas(),
         blob_hashes: Vec::new(),
-        max_fee_per_blob_gas: None,
-        authorization_list: None,
+        max_fee_per_blob_gas: 0,
+        authorization_list: Vec::new(),
     };
-    let ResultAndState { result, state } = Evm::builder()
+    let context = Context::mainnet()
         .with_db(&mut db)
-        .with_env_with_handler_cfg(EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx_env))
-        .build()
-        .transact()
-        .unwrap();
+        .with_cfg(cfg)
+        .with_block(block_env);
+
+    let ResultAndState { result, mut state } = Evm::new(
+        context,
+        EthInstructions::default(),
+        EthPrecompiles::default(),
+    )
+    .transact(tx_env)
+    .unwrap();
+    fix_state_diff(block.number, tx_index, is_system_tx, &mut state);
     db.commit(state);
 
     let gas_used = result.gas_used();
@@ -219,7 +277,11 @@ fn apply_tx(
     }
 }
 
-fn process_block(state: &mut InMemoryDB, block_and_receipts: &BlockAndReceipts) {
+fn process_block(
+    state: &mut InMemoryDB,
+    evm_map: &BTreeMap<Address, Address>,
+    block_and_receipts: &BlockAndReceipts,
+) {
     let BlockAndReceipts {
         block,
         receipts,
@@ -228,12 +290,17 @@ fn process_block(state: &mut InMemoryDB, block_and_receipts: &BlockAndReceipts) 
     let EvmBlock::Reth115(block) = block;
 
     let mut cumulative_gas_used = 0;
-    for system_tx in system_txs {
+    for (tx_index, system_tx) in system_txs.iter().enumerate() {
         let SystemTx { tx, receipt } = system_tx;
         let computed_receipt = apply_tx(
             block,
-            NATIVE_TOKEN_SYSTEM_ADDRESS,
+            if tx.input().is_empty() {
+                NATIVE_TOKEN_SYSTEM_ADDRESS
+            } else {
+                evm_map[&tx.to().unwrap()]
+            },
             tx,
+            tx_index,
             true,
             cumulative_gas_used,
             state,
@@ -246,13 +313,14 @@ fn process_block(state: &mut InMemoryDB, block_and_receipts: &BlockAndReceipts) 
 
     let mut cumulative_gas_used = 0;
     let mut computed_receipts = Vec::new();
-    for tx_signed in &block.body().transactions {
+    for (tx_index, tx_signed) in block.body().transactions.iter().enumerate() {
         let (tx_signed, signer) = tx_signed.clone().try_into_recovered().unwrap().into_parts();
         let transaction = tx_signed.into_transaction();
         let receipt = apply_tx(
             block,
             signer,
             &transaction,
+            tx_index,
             false,
             cumulative_gas_used,
             state,
@@ -263,53 +331,63 @@ fn process_block(state: &mut InMemoryDB, block_and_receipts: &BlockAndReceipts) 
     // Before this height threshold, the blockhash opcode would just return keccak256(number.to_string().as_bytes())
     if block.header().number >= NON_PLACEHOLDER_BLOCK_HASH_HEIGHT {
         *state
+            .cache
             .block_hashes
             .entry(U256::from(block.header().number))
             .or_default() = block.hash();
     }
-    let expected_receipts: Vec<Receipt> = receipts.into_iter().cloned().map(Into::into).collect();
+    let expected_receipts: Vec<Receipt> = receipts.iter().cloned().map(Into::into).collect();
     assert_eq!(expected_receipts, computed_receipts);
 }
 
 fn main() -> Result<()> {
-    let start = Instant::now();
-    let mut block_paths = Vec::new();
-    process_dir_recursive(
-        &PathBuf::from(std::env::args().nth(1).unwrap()),
-        &mut block_paths,
-    )?;
-    block_paths.sort();
-    let n_blocks = block_paths.len();
-    println!("Found n={n_blocks} blocks in {:?}", start.elapsed());
+    let evm_map = evm_map()?;
+
+    let start_block = 1;
+    let end_block = std::env::args().nth(2).unwrap().parse::<u64>().unwrap();
+    println!("{start_block} -> {end_block}");
 
     let start = Instant::now();
-    let mut blocks = Vec::new();
-    let mut i = 0;
-    for chunk in block_paths.chunks(10000) {
-        let start = Instant::now();
-        for &(block_num, ref path) in chunk {
-            i += 1;
-            assert_eq!(block_num, i);
+    let ranges: Vec<_> = (start_block..=end_block)
+        .step_by(CHUNK_SIZE as usize)
+        .collect();
+    let dir = std::env::args().nth(1).unwrap();
+    let blocks: Vec<_> = ranges
+        .into_par_iter()
+        .map(|chunk| {
+            let mut blocks: Vec<(_, BlockAndReceipts)> = Vec::new();
+            let start = Instant::now();
+            let start_block = chunk;
+            let end_block = (chunk + CHUNK_SIZE - 1).min(end_block);
+            for block_num in start_block..=end_block {
+                let f = ((block_num - 1) / 1_000_000) * 1_000_000;
+                let s = ((block_num - 1) / 1_000) * 1_000;
+                let path = format!("{dir}/{f}/{s}/{block_num}.rmp.lz4");
+                let path = PathBuf::from(path);
 
-            let block_and_receipts = read_block_and_receipts(path)
-                .inspect_err(|_| println!("failed to read block {block_num}"))?;
+                let block_and_receipts = read_block_and_receipts(&path)
+                    .inspect_err(|_| println!("failed to read block {block_num}"))
+                    .unwrap();
 
-            blocks.push((block_num, block_and_receipts));
-        }
-        println!(
-            "Deserialized blocks {}-{} in {:?}",
-            chunk.first().unwrap().0,
-            chunk.last().unwrap().0,
-            start.elapsed()
-        );
-    }
-    println!("Deserialized n={n_blocks} blocks in {:?}", start.elapsed());
+                blocks.push((block_num, block_and_receipts));
+            }
+            println!(
+                "Deserialized blocks {}-{} in {:?}",
+                start_block,
+                end_block,
+                start.elapsed()
+            );
+            (chunk, blocks)
+        })
+        .collect();
+    println!("Deserialized n={end_block} blocks in {:?}", start.elapsed());
 
     let start = Instant::now();
     let mut state = genesis_state();
-    for chunk in blocks.chunks(10000) {
+    for (i, chunk) in blocks {
+        println!("{i}");
         let start = Instant::now();
-        for &(block_num, ref block_and_receipts) in chunk {
+        for &(block_num, ref block_and_receipts) in &chunk {
             if block_num == 1 {
                 deploy_system_contract(
                     &mut state,
@@ -326,20 +404,25 @@ fn main() -> Result<()> {
                     ),
                 );
             }
-            process_block(&mut state, block_and_receipts);
+            process_block(&mut state, &evm_map, block_and_receipts);
         }
         println!(
             "Processed blocks {}-{} in {:?}",
-            chunk.first().unwrap().0,
-            chunk.last().unwrap().0,
+            i,
+            i + (chunk.len() as u64),
             start.elapsed()
         );
     }
-    println!("Processed n={n_blocks} blocks in {:?}", start.elapsed());
+    println!(
+        "Processed n={} blocks in {:?}",
+        end_block - start_block + 1,
+        start.elapsed()
+    );
 
     Ok(())
 }
 
+const CHUNK_SIZE: u64 = 10000;
 const CHAIN_ID: u64 = 999;
 const NATIVE_TOKEN_SYSTEM_ADDRESS: Address = address!("0x2222222222222222222222222222222222222222");
 const WHYPE_CONTRACT_ADDRESS: Address = address!("0x5555555555555555555555555555555555555555");
