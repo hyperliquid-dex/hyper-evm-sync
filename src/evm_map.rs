@@ -31,7 +31,7 @@ fn fetch_spot_meta() -> Result<SpotMeta> {
     Ok(response.json()?)
 }
 
-pub(crate) fn evm_map() -> Result<BTreeMap<Address, Address>> {
+pub fn evm_map() -> Result<BTreeMap<Address, Address>> {
     let meta = fetch_spot_meta()?;
     let mut map = BTreeMap::new();
     for token in &meta.tokens {

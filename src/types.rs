@@ -4,20 +4,20 @@ use reth_primitives::{Receipt, SealedBlock, Transaction};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BlockAndReceipts {
-    pub(crate) block: EvmBlock,
-    pub(crate) receipts: Vec<LegacyReceipt>,
+pub struct BlockAndReceipts {
+    pub block: EvmBlock,
+    pub receipts: Vec<LegacyReceipt>,
     #[serde(default)]
-    pub(crate) system_txs: Vec<SystemTx>,
+    pub system_txs: Vec<SystemTx>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum EvmBlock {
+pub enum EvmBlock {
     Reth115(SealedBlock),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LegacyReceipt {
+pub struct LegacyReceipt {
     tx_type: LegacyTxType,
     success: bool,
     cumulative_gas_used: u64,
@@ -34,9 +34,9 @@ enum LegacyTxType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SystemTx {
-    pub(crate) tx: Transaction,
-    pub(crate) receipt: Option<LegacyReceipt>,
+pub struct SystemTx {
+    pub tx: Transaction,
+    pub receipt: Option<LegacyReceipt>,
 }
 
 impl From<LegacyReceipt> for Receipt {
