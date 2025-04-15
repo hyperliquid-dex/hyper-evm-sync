@@ -1,6 +1,7 @@
-use crate::types::BlockAndReceipts;
+use crate::types::{AbciState, BlockAndReceipts};
 use anyhow::Result;
 use rayon::prelude::*;
+use revm::InMemoryDB;
 use std::{
     fs::File,
     io::Read,
@@ -34,9 +35,7 @@ pub fn read_blocks(
     chunk_size: u64,
 ) -> Vec<(u64, Vec<(u64, BlockAndReceipts)>)> {
     let start = Instant::now();
-    let ranges: Vec<_> = (start_block..=end_block)
-        .step_by(chunk_size as usize)
-        .collect();
+    let ranges: Vec<_> = (start_block..=end_block).step_by(usize::try_from(chunk_size).unwrap()).collect();
     let blocks: Vec<_> = ranges
         .into_par_iter()
         .map(|chunk| {
@@ -56,15 +55,18 @@ pub fn read_blocks(
 
                 blocks.push((block_num, block_and_receipts));
             }
-            println!(
-                "Deserialized blocks {}-{} in {:?}",
-                start_block,
-                end_block,
-                start.elapsed()
-            );
+            println!("Deserialized blocks {}-{} in {:?}", start_block, end_block, start.elapsed());
             (chunk, blocks)
         })
         .collect();
     println!("Deserialized n={end_block} blocks in {:?}", start.elapsed());
     blocks
+}
+
+pub fn read_abci_state(fln: String) -> Result<(u64, InMemoryDB)> {
+    let mut file = File::open(fln)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let state: AbciState = rmp_serde::from_slice(&buffer)?;
+    Ok(state.into_next_block_num_and_in_memory_db())
 }

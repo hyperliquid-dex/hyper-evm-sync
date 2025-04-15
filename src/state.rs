@@ -1,10 +1,12 @@
-use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
+use alloy::{
+    consensus::constants::KECCAK_EMPTY,
+    primitives::{address, keccak256, Address, Bytes, B256, U256},
+};
 use itertools::Itertools;
 use revm::{
-    Database, DatabaseCommit, DatabaseRef, InMemoryDB,
     db::AccountState,
     primitives::{Account, AccountInfo, Bytecode, HashMap},
+    Database, DatabaseCommit, DatabaseRef, InMemoryDB,
 };
 
 pub trait State: Database + DatabaseRef {
@@ -18,10 +20,10 @@ pub trait State: Database + DatabaseRef {
 
 #[derive(Debug, PartialEq)]
 pub struct StateHash {
-    pub account: B256,
-    pub contract: B256,
-    pub storage: B256,
-    pub block_hash: B256,
+    pub accounts_hash: B256,
+    pub contracts_hash: B256,
+    pub storage_hash: B256,
+    pub block_hashes_hash: B256,
 }
 
 impl State for InMemoryDB {
@@ -50,7 +52,7 @@ impl State for InMemoryDB {
     fn inject_contract(&mut self, contract_address: Address, deployed_bytecode: Bytes) {
         let bytecode_hash = keccak256(&deployed_bytecode);
         let account = self.accounts.entry(contract_address).or_default();
-        let bytecode = Bytecode::new_raw(deployed_bytecode.clone());
+        let bytecode = Bytecode::new_raw(deployed_bytecode);
         account.info.code_hash = bytecode.hash_slow();
         account.info.code = Some(bytecode.clone());
         account.storage.clear();
@@ -59,22 +61,13 @@ impl State for InMemoryDB {
     }
 
     fn insert_storage(&mut self, address: Address, key: U256, value: U256) {
-        self.accounts
-            .entry(address)
-            .or_default()
-            .storage
-            .insert(key, value);
+        self.accounts.entry(address).or_default().storage.insert(key, value);
     }
 
     fn blake3_hash_slow(&self) -> StateHash {
         let mut hasher = blake3::Hasher::new();
         for (address, db_account) in self.accounts.iter().sorted_by_key(|(address, _)| **address) {
-            let AccountInfo {
-                balance,
-                nonce,
-                code_hash,
-                code: _,
-            } = db_account.info;
+            let AccountInfo { balance, nonce, code_hash, code: _ } = db_account.info;
             if balance.is_zero() && nonce == 0 && code_hash == KECCAK_EMPTY {
                 continue;
             }
@@ -85,13 +78,13 @@ impl State for InMemoryDB {
             hasher.update(address.as_slice());
             hasher.update(&res);
         }
-        let account = hasher.finalize().as_bytes().into();
+        let accounts_hash = hasher.finalize().as_bytes().into();
 
         let mut hasher = blake3::Hasher::new();
         for code_hash in self.contracts.keys().sorted() {
             hasher.update(code_hash.as_slice());
         }
-        let contract = hasher.finalize().as_bytes().into();
+        let contracts_hash = hasher.finalize().as_bytes().into();
 
         let mut hasher = blake3::Hasher::new();
         for (address, db_account) in self.accounts.iter().sorted_by_key(|(address, _)| **address) {
@@ -110,7 +103,7 @@ impl State for InMemoryDB {
                 hasher.update(&value.to_be_bytes::<32>());
             }
         }
-        let storage = hasher.finalize().as_bytes().into();
+        let storage_hash = hasher.finalize().as_bytes().into();
 
         // Note: this hash may change depending on how block_hashes is pruned
         let mut hasher = blake3::Hasher::new();
@@ -118,13 +111,8 @@ impl State for InMemoryDB {
             hasher.update(&block_num.to_be_bytes::<32>());
             hasher.update(block_hash.as_slice());
         }
-        let block_hash = hasher.finalize().as_bytes().into();
+        let block_hashes_hash = hasher.finalize().as_bytes().into();
 
-        StateHash {
-            account,
-            contract,
-            storage,
-            block_hash,
-        }
+        StateHash { accounts_hash, contracts_hash, storage_hash, block_hashes_hash }
     }
 }

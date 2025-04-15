@@ -1,18 +1,19 @@
-use alloy_primitives::Address;
-use anyhow::Result;
+use crate::run::{MAINNET_CHAIN_ID, TESTNET_CHAIN_ID};
+use alloy::primitives::Address;
+use anyhow::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EvmContract {
-    pub address: Address,
+    address: Address,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpotToken {
-    pub index: u64,
+    index: u64,
     #[serde(rename = "evmContract")]
-    pub evm_contract: Option<EvmContract>,
+    evm_contract: Option<EvmContract>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,19 +21,19 @@ struct SpotMeta {
     tokens: Vec<SpotToken>,
 }
 
-fn fetch_spot_meta() -> Result<SpotMeta> {
-    let url = "https://api.hyperliquid.xyz";
-    let url = format!("{}/info", url);
+fn fetch_spot_meta(chain_id: u64) -> Result<SpotMeta> {
+    let url = match chain_id {
+        MAINNET_CHAIN_ID => "https://api.hyperliquid.xyz/info",
+        TESTNET_CHAIN_ID => "https://api.hyperliquid-testnet.xyz/info",
+        _ => return Err(Error::msg("unknown chain id")),
+    };
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({"type": "spotMeta"}))
-        .send()?;
+    let response = client.post(url).json(&serde_json::json!({"type": "spotMeta"})).send()?;
     Ok(response.json()?)
 }
 
-pub fn evm_map() -> Result<BTreeMap<Address, Address>> {
-    let meta = fetch_spot_meta()?;
+pub fn erc20_contract_to_system_address(chain_id: u64) -> Result<BTreeMap<Address, Address>> {
+    let meta = fetch_spot_meta(chain_id)?;
     let mut map = BTreeMap::new();
     for token in &meta.tokens {
         if let Some(evm_contract) = &token.evm_contract {
