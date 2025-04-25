@@ -13,7 +13,11 @@ struct ReplayPrecompile(Arc<HashMap<ReadPrecompileInput, ReadPrecompileResult>>)
 impl StatefulPrecompile for ReplayPrecompile {
     // This is a non-exact inversion of the PrecompileResult -> InterpreterResult -> ReadPrecompileResult function
     fn call(&self, bytes: &Bytes, gas_limit: u64, _env: &Env) -> PrecompileResult {
-        match *self.0.get(&ReadPrecompileInput { input: bytes.clone(), gas_limit }).expect("missing precompile call") {
+        match *self
+            .0
+            .get(&ReadPrecompileInput { input: bytes.clone(), gas_limit })
+            .unwrap_or(&ReadPrecompileResult::OutOfGas)
+        {
             ReadPrecompileResult::Ok { gas_used, ref bytes } => Ok(PrecompileOutput { gas_used, bytes: bytes.clone() }),
             ReadPrecompileResult::OutOfGas => Err(PrecompileError::OutOfGas.into()),
             ReadPrecompileResult::Error => Err(PrecompileError::other("precompile failed").into()),
