@@ -1,11 +1,15 @@
-use crate::types::{AbciState, BlockAndReceipts};
+use crate::types::{AbciState, BlockAndReceipts, EvmState};
 use anyhow::Result;
+use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
+use aws_sdk_s3::{types::RequestPayer, Client};
+use futures::future::join_all;
 use rayon::prelude::*;
 use revm::InMemoryDB;
 use std::{
-    fs::File,
-    io::Read,
+    fs::{create_dir_all, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -35,7 +39,9 @@ pub fn read_blocks(
     chunk_size: u64,
 ) -> Vec<(u64, Vec<(u64, BlockAndReceipts)>)> {
     let start = Instant::now();
-    let ranges: Vec<_> = (start_block..=end_block).step_by(usize::try_from(chunk_size).unwrap()).collect();
+    let ranges: Vec<_> = (start_block..=end_block)
+        .step_by(usize::try_from(chunk_size).unwrap())
+        .collect();
     let blocks: Vec<_> = ranges
         .into_par_iter()
         .map(|chunk| {
@@ -55,7 +61,12 @@ pub fn read_blocks(
 
                 blocks.push((block_num, block_and_receipts));
             }
-            println!("Deserialized blocks {}-{} in {:?}", start_block, end_block, start.elapsed());
+            println!(
+                "Deserialized blocks {}-{} in {:?}",
+                start_block,
+                end_block,
+                start.elapsed()
+            );
             (chunk, blocks)
         })
         .collect();
@@ -69,4 +80,127 @@ pub fn read_abci_state(fln: String) -> Result<(u64, InMemoryDB)> {
     file.read_to_end(&mut buffer)?;
     let state: AbciState = rmp_serde::from_slice(&buffer)?;
     Ok(state.into_next_block_num_and_in_memory_db())
+}
+
+pub fn read_evm_state(fln: String) -> Result<(u64, InMemoryDB)> {
+    let mut file = File::open(fln)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let state: (u64, EvmState) = rmp_serde::from_slice(&buffer)?;
+    Ok((state.0, state.1.into()))
+}
+
+fn create_file_with_dirs(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?; // Ensure all parent directories exist
+    }
+    Ok(File::create(path)?) // Then create the file
+}
+
+pub fn snapshot_evm_state(next_block_num: u64, state: EvmState, fln: String) -> Result<()> {
+    let mut file = create_file_with_dirs(Path::new(&fln))?;
+    let buffer = rmp_serde::to_vec(&(next_block_num, state))?;
+    file.write_all(&buffer)?;
+    Ok(())
+}
+
+fn block_key(block_num: u64) -> String {
+    let f = ((block_num - 1) / 1_000_000) * 1_000_000;
+    let s = ((block_num - 1) / 1_000) * 1_000;
+    format!("{f}/{s}/{block_num}.rmp.lz4")
+}
+
+pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Result<Option<u64>> {
+    let region = RegionProviderChain::default_provider().or_else("us-east-1");
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region)
+        .load()
+        .await;
+    let s3 = Arc::new(Client::new(&config));
+
+    let bucket = "hl-mainnet-evm-blocks";
+    let mut futures = Vec::with_capacity((end_block - start_block + 1) as usize);
+    for block_num in start_block..=end_block {
+        let local_path = PathBuf::from(dir);
+        let s3 = s3.clone();
+        futures.push(async move {
+            let key = block_key(block_num);
+            let local_path: PathBuf = local_path.clone().join(&key);
+            if let Some(parent) = local_path.parent() {
+                create_dir_all(parent)?;
+            }
+
+            if local_path.is_file() {
+                return Ok(Some(block_num));
+            }
+
+            println!("Downloading: {}", key);
+            let obj = s3
+                .get_object()
+                .bucket(bucket)
+                .key(key.clone())
+                .request_payer(RequestPayer::Requester)
+                .send()
+                .await;
+
+            match obj {
+                Ok(obj) => {
+                    let mut body = obj.body.into_async_read();
+                    let mut file = tokio::fs::File::create(&local_path).await?;
+                    tokio::io::copy(&mut body, &mut file).await?;
+                    Ok(Some(block_num))
+                }
+                Err(err) => {
+                    if let Some(s3_err) = err.as_service_error() {
+                        if s3_err.is_no_such_key() {
+                            Ok(None)
+                        } else {
+                            Err(err.into())
+                        }
+                    } else {
+                        Err(err.into())
+                    }
+                }
+            }
+        })
+    }
+    let results: Vec<Result<Option<u64>>> = join_all(futures).await;
+    let results: Vec<Option<u64>> = results.into_iter().collect::<Result<Vec<_>>>()?;
+    let max_block_num: Option<u64> = results
+        .iter()
+        .filter_map(|&block_num| block_num) // Remove None, unwrap Some
+        .max();
+    Ok(max_block_num)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use crate::{
+        fs::{download_blocks, read_abci_state, read_evm_state, snapshot_evm_state},
+        state::State,
+    };
+    use anyhow::Result;
+
+    #[tokio::test]
+    async fn test_block_download() -> Result<()> {
+        let time = Instant::now();
+        let max_block = download_blocks("~/hl-mainnet-evm-blocks", 4000000, 4001000).await?;
+        println!("{:?} downloaded in {:?}", max_block, time.elapsed());
+        Ok(())
+    }
+
+    #[test]
+    fn test_evm_state_serde() -> Result<()> {
+        let abci_state_path = "tmp/abci_state.rmp";
+        let state = read_abci_state(abci_state_path.to_owned())?;
+        let snapshot_path = "tmp/snapshot.rmp";
+        let hash1 = state.1.blake3_hash_slow();
+        snapshot_evm_state(state.0, state.1.into(), snapshot_path.to_owned())?;
+        let state = read_evm_state(snapshot_path.to_owned())?;
+        let hash2 = state.1.blake3_hash_slow();
+        assert_eq!(hash1, hash2);
+        Ok(())
+    }
 }

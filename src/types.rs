@@ -78,18 +78,21 @@ struct HyperEvm {
     latest_block2: EvmBlock,
 }
 
-#[derive(Deserialize)]
-struct EvmState {
+#[derive(Serialize, Deserialize)]
+pub struct EvmState {
     evm_db: EvmDb,
     block_hashes: Vec<(U256, B256)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 enum EvmDb {
-    InMemory { accounts: Vec<(Address, DbAccount)>, contracts: Vec<(B256, Bytecode)> },
+    InMemory {
+        accounts: Vec<(Address, DbAccount)>,
+        contracts: Vec<(B256, Bytecode)>,
+    },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DbAccount {
     #[serde(rename = "i", alias = "info", default)]
     info: DbAccountInfo,
@@ -97,7 +100,7 @@ struct DbAccount {
     storage: Vec<(U256, U256)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DbAccountInfo {
     #[serde(rename = "b", alias = "balance", default)]
     balance: U256,
@@ -109,7 +112,11 @@ struct DbAccountInfo {
 
 impl Default for DbAccountInfo {
     fn default() -> Self {
-        Self { balance: U256::ZERO, nonce: 0, code_hash: KECCAK_EMPTY }
+        Self {
+            balance: U256::ZERO,
+            nonce: 0,
+            code_hash: KECCAK_EMPTY,
+        }
     }
 }
 
@@ -119,24 +126,89 @@ const fn keccak_empty() -> B256 {
 
 impl AbciState {
     pub fn into_next_block_num_and_in_memory_db(self) -> (u64, InMemoryDB) {
-        let HyperEvm { state2, latest_block2 } = self.exchange.hyper_evm;
-
+        let HyperEvm {
+            state2,
+            latest_block2,
+        } = self.exchange.hyper_evm;
         let EvmBlock::Reth115(sealed_block) = latest_block2;
-        let next_block_num = sealed_block.number + 1;
+        let next_block_num = sealed_block.number;
+        (next_block_num, state2.into())
+    }
+}
 
+impl From<InMemoryDB> for EvmState {
+    fn from(db: InMemoryDB) -> EvmState {
+        let block_hashes = db.block_hashes.into_iter().collect();
+        let accounts = db
+            .accounts
+            .into_iter()
+            .map(|(address, db_account)| {
+                let revm::db::DbAccount {
+                    info:
+                        AccountInfo {
+                            balance,
+                            nonce,
+                            code_hash,
+                            ..
+                        },
+                    storage,
+                    ..
+                } = db_account;
+                (
+                    address,
+                    DbAccount {
+                        info: DbAccountInfo {
+                            balance,
+                            nonce,
+                            code_hash,
+                        },
+                        storage: storage.into_iter().collect(),
+                    },
+                )
+            })
+            .collect();
+        let contracts = db.contracts.into_iter().collect();
+        let evm_db = EvmDb::InMemory {
+            accounts,
+            contracts,
+        };
+        Self {
+            evm_db,
+            block_hashes,
+        }
+    }
+}
+
+impl From<EvmState> for InMemoryDB {
+    fn from(state: EvmState) -> Self {
         let mut res = InMemoryDB::default();
-        let EvmState { evm_db, block_hashes } = state2;
-        let EvmDb::InMemory { accounts, contracts } = evm_db;
+        let EvmState {
+            evm_db,
+            block_hashes,
+        } = state;
+        let EvmDb::InMemory {
+            accounts,
+            contracts,
+        } = evm_db;
         res.block_hashes = block_hashes.into_iter().collect();
         res.accounts = accounts
             .into_iter()
             .map(|(address, db_account)| {
                 let DbAccount { info, storage } = db_account;
-                let DbAccountInfo { balance, nonce, code_hash } = info;
+                let DbAccountInfo {
+                    balance,
+                    nonce,
+                    code_hash,
+                } = info;
                 (
                     address,
                     revm::db::DbAccount {
-                        info: AccountInfo { balance, nonce, code_hash, code: None },
+                        info: AccountInfo {
+                            balance,
+                            nonce,
+                            code_hash,
+                            code: None,
+                        },
                         account_state: AccountState::Touched,
                         storage: storage.into_iter().collect(),
                     },
@@ -145,13 +217,18 @@ impl AbciState {
             .collect();
         res.contracts = contracts.into_iter().collect();
 
-        (next_block_num, res)
+        res
     }
 }
 
 impl From<LegacyReceipt> for Receipt {
     fn from(value: LegacyReceipt) -> Self {
-        let LegacyReceipt { tx_type, success, cumulative_gas_used, logs } = value;
+        let LegacyReceipt {
+            tx_type,
+            success,
+            cumulative_gas_used,
+            logs,
+        } = value;
         let tx_type = match tx_type {
             LegacyTxType::Legacy => TxType::Legacy,
             LegacyTxType::Eip2930 => TxType::Eip2930,
@@ -159,25 +236,45 @@ impl From<LegacyReceipt> for Receipt {
             LegacyTxType::Eip4844 => TxType::Eip4844,
             LegacyTxType::Eip7702 => TxType::Eip7702,
         };
-        Self { tx_type, success, cumulative_gas_used, logs }
+        Self {
+            tx_type,
+            success,
+            cumulative_gas_used,
+            logs,
+        }
     }
 }
 
 impl From<AbciState> for InMemoryDB {
     fn from(value: AbciState) -> Self {
         let mut res = Self::default();
-        let EvmState { evm_db, block_hashes } = value.exchange.hyper_evm.state2;
-        let EvmDb::InMemory { accounts, contracts } = evm_db;
+        let EvmState {
+            evm_db,
+            block_hashes,
+        } = value.exchange.hyper_evm.state2;
+        let EvmDb::InMemory {
+            accounts,
+            contracts,
+        } = evm_db;
         res.block_hashes = block_hashes.into_iter().collect();
         res.accounts = accounts
             .into_iter()
             .map(|(address, db_account)| {
                 let DbAccount { info, storage } = db_account;
-                let DbAccountInfo { balance, nonce, code_hash } = info;
+                let DbAccountInfo {
+                    balance,
+                    nonce,
+                    code_hash,
+                } = info;
                 (
                     address,
                     revm::db::DbAccount {
-                        info: AccountInfo { balance, nonce, code_hash, code: None },
+                        info: AccountInfo {
+                            balance,
+                            nonce,
+                            code_hash,
+                            code: None,
+                        },
                         account_state: AccountState::Touched,
                         storage: storage.into_iter().collect(),
                     },

@@ -1,30 +1,42 @@
 use crate::{
+    fs::snapshot_evm_state,
     precompile::set_replay_precompiles,
     state::{State, StateHash},
-    types::{BlockAndReceipts, EvmBlock, ReadPrecompileInput, ReadPrecompileResult, SystemTx},
+    types::{
+        BlockAndReceipts, EvmBlock, EvmState, ReadPrecompileInput, ReadPrecompileResult, SystemTx,
+    },
 };
 use alloy::{
     consensus::Transaction as _,
     primitives::{address, bytes, Address, Bytes, B256, U256},
 };
-use reth_primitives::{transaction::SignedTransactionIntoRecoveredExt, Receipt, SealedBlock, Transaction};
+use reth_primitives::{
+    transaction::SignedTransactionIntoRecoveredExt, Receipt, SealedBlock, Transaction,
+};
 use revm::{
     primitives::{
-        Account, BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, HandlerCfg, HashMap,
-        ResultAndState, SpecId, TxEnv,
+        Account, BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg,
+        HandlerCfg, HashMap, ResultAndState, SpecId, TxEnv,
     },
     Database, Evm,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, fs::create_dir_all, path::Path, sync::Arc, time::Instant};
 
-fn deploy_system_contract<S: State>(state: &mut S, contract_address: Address, deployed_bytecode: Bytes) {
+fn deploy_system_contract<S: State>(
+    state: &mut S,
+    contract_address: Address,
+    deployed_bytecode: Bytes,
+) {
     state.inject_contract(contract_address, deployed_bytecode);
 
     if contract_address == WHYPE_CONTRACT_ADDRESS {
-        for (slot, value) in
-            [const { encode_short_string("Wrapped HYPE") }, const { encode_short_string("WHYPE") }, U256::from(18)]
-                .into_iter()
-                .enumerate()
+        for (slot, value) in [
+            const { encode_short_string("Wrapped HYPE") },
+            const { encode_short_string("WHYPE") },
+            U256::from(18),
+        ]
+        .into_iter()
+        .enumerate()
         {
             state.insert_storage(contract_address, U256::from(slot), value);
         }
@@ -39,24 +51,114 @@ fn fix_mainnet_state_diff(
 ) {
     // Improper self destructs
     for (block_num, idx, is_system, address) in [
-        (1_467_569, 0, false, address!("0x33f6fe38c55cb100ce27b3138e5d2d041648364f")),
-        (1_467_631, 0, false, address!("0x33f6fe38c55cb100ce27b3138e5d2d041648364f")),
-        (1_499_313, 2, false, address!("0xe27bfc0a812b38927ff646f24af9149f45deb550")),
-        (1_499_406, 0, false, address!("0xe27bfc0a812b38927ff646f24af9149f45deb550")),
-        (1_499_685, 0, false, address!("0xfee3932b75a87e86930668a6ab3ed43b404c8a30")),
-        (1_514_843, 0, false, address!("0x723e5fbbeed025772a91240fd0956a866a41a603")),
-        (1_514_936, 0, false, address!("0x723e5fbbeed025772a91240fd0956a866a41a603")),
-        (1_530_529, 2, false, address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a")),
-        (1_530_622, 2, false, address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a")),
-        (1_530_684, 3, false, address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a")),
-        (1_530_777, 3, false, address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a")),
-        (1_530_839, 2, false, address!("0x692a343fc401a7755f8fc2facf61af426adaf061")),
-        (1_530_901, 0, false, address!("0xfd9716f16596715ce765dabaee11787870e04b8a")),
-        (1_530_994, 3, false, address!("0xfd9716f16596715ce765dabaee11787870e04b8a")),
-        (1_531_056, 4, false, address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4")),
-        (1_531_149, 0, false, address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4")),
-        (1_531_211, 3, false, address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4")),
-        (1_531_366, 1, false, address!("0x9a90a517d27a9e60e454c96fefbbe94ff244ed6f")),
+        (
+            1_467_569,
+            0,
+            false,
+            address!("0x33f6fe38c55cb100ce27b3138e5d2d041648364f"),
+        ),
+        (
+            1_467_631,
+            0,
+            false,
+            address!("0x33f6fe38c55cb100ce27b3138e5d2d041648364f"),
+        ),
+        (
+            1_499_313,
+            2,
+            false,
+            address!("0xe27bfc0a812b38927ff646f24af9149f45deb550"),
+        ),
+        (
+            1_499_406,
+            0,
+            false,
+            address!("0xe27bfc0a812b38927ff646f24af9149f45deb550"),
+        ),
+        (
+            1_499_685,
+            0,
+            false,
+            address!("0xfee3932b75a87e86930668a6ab3ed43b404c8a30"),
+        ),
+        (
+            1_514_843,
+            0,
+            false,
+            address!("0x723e5fbbeed025772a91240fd0956a866a41a603"),
+        ),
+        (
+            1_514_936,
+            0,
+            false,
+            address!("0x723e5fbbeed025772a91240fd0956a866a41a603"),
+        ),
+        (
+            1_530_529,
+            2,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1_530_622,
+            2,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1_530_684,
+            3,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1_530_777,
+            3,
+            false,
+            address!("0xa694e8fd8f4a177dd23636d838e9f1fb2138d87a"),
+        ),
+        (
+            1_530_839,
+            2,
+            false,
+            address!("0x692a343fc401a7755f8fc2facf61af426adaf061"),
+        ),
+        (
+            1_530_901,
+            0,
+            false,
+            address!("0xfd9716f16596715ce765dabaee11787870e04b8a"),
+        ),
+        (
+            1_530_994,
+            3,
+            false,
+            address!("0xfd9716f16596715ce765dabaee11787870e04b8a"),
+        ),
+        (
+            1_531_056,
+            4,
+            false,
+            address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4"),
+        ),
+        (
+            1_531_149,
+            0,
+            false,
+            address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4"),
+        ),
+        (
+            1_531_211,
+            3,
+            false,
+            address!("0xdc67c2b8349ca20f58760e08371fc9271e82b5a4"),
+        ),
+        (
+            1_531_366,
+            1,
+            false,
+            address!("0x9a90a517d27a9e60e454c96fefbbe94ff244ed6f"),
+        ),
     ] {
         if block_number == block_num && tx_index == idx && is_system_tx == is_system {
             changes.remove(&address);
@@ -67,7 +169,8 @@ fn fix_mainnet_state_diff(
 struct ApplyTxArgs<'a, S> {
     chain_id: u64,
     block: &'a SealedBlock,
-    precompile_results: &'a Arc<HashMap<Address, Arc<HashMap<ReadPrecompileInput, ReadPrecompileResult>>>>,
+    precompile_results:
+        &'a Arc<HashMap<Address, Arc<HashMap<ReadPrecompileInput, ReadPrecompileResult>>>>,
     sender: Address,
     transaction: &'a Transaction,
     tx_index: usize,
@@ -92,7 +195,10 @@ where
         mut cumulative_gas_used,
         mut db,
     } = args;
-    let mut cfg = CfgEnvWithHandlerCfg::new(CfgEnv::default().with_chain_id(chain_id), HandlerCfg::new(SpecId::CANCUN));
+    let mut cfg = CfgEnvWithHandlerCfg::new(
+        CfgEnv::default().with_chain_id(chain_id),
+        HandlerCfg::new(SpecId::CANCUN),
+    );
     let basefee = if is_system_tx {
         cfg.disable_eip3607 = true;
         0
@@ -118,7 +224,9 @@ where
         data: transaction.input().clone(),
         nonce: Some(transaction.nonce()),
         chain_id: transaction.chain_id(),
-        access_list: transaction.access_list().map_or_else(Vec::new, |access_list| access_list.0.clone()),
+        access_list: transaction
+            .access_list()
+            .map_or_else(Vec::new, |access_list| access_list.0.clone()),
         gas_priority_fee: transaction.max_priority_fee_per_gas().map(U256::from),
         blob_hashes: Vec::new(),
         max_fee_per_blob_gas: None,
@@ -159,7 +267,12 @@ fn process_block<S>(
     S: State,
     <S as Database>::Error: std::fmt::Debug,
 {
-    let BlockAndReceipts { block, receipts, system_txs, read_precompile_calls } = block_and_receipts;
+    let BlockAndReceipts {
+        block,
+        receipts,
+        system_txs,
+        read_precompile_calls,
+    } = block_and_receipts;
     let EvmBlock::Reth115(block) = block;
     let precompile_results = Arc::new(
         read_precompile_calls
@@ -212,7 +325,11 @@ fn process_block<S>(
     let mut cumulative_gas_used = 0;
     let mut computed_receipts = Vec::new();
     for (tx_index, tx_signed) in block.body().transactions.iter().enumerate() {
-        let (tx_signed, signer) = tx_signed.clone().try_into_ecrecovered().unwrap().into_parts();
+        let (tx_signed, signer) = tx_signed
+            .clone()
+            .try_into_ecrecovered()
+            .unwrap()
+            .into_parts();
         let transaction = tx_signed.transaction;
         let receipt = apply_tx(ApplyTxArgs {
             chain_id,
@@ -241,11 +358,16 @@ pub fn run_blocks<S>(
     mut state: S,
     blocks: Vec<(u64, Vec<(u64, BlockAndReceipts)>)>,
     erc20_contract_to_system_address: &BTreeMap<Address, Address>,
+    snapshot_dir: Option<String>,
+    chunk_size: u64,
 ) -> StateHash
 where
-    S: State,
+    S: State + Into<EvmState> + Clone,
     <S as Database>::Error: std::fmt::Debug,
 {
+    if let Some(snapshot_dir) = &snapshot_dir {
+        create_dir_all(Path::new(snapshot_dir)).unwrap();
+    }
     let start_block = blocks.first().unwrap().1.first().unwrap().0;
     let end_block = blocks.last().unwrap().1.last().unwrap().0;
     let start = Instant::now();
@@ -254,19 +376,49 @@ where
         println!("{i}");
         let start = Instant::now();
         for &(block_num, ref block_and_receipts) in &chunk {
-            let BlockAndReceipts { block: EvmBlock::Reth115(block), .. } = block_and_receipts;
+            let BlockAndReceipts {
+                block: EvmBlock::Reth115(block),
+                ..
+            } = block_and_receipts;
             assert_eq!(block_num, block.number);
-            process_block(chain_id, &mut state, erc20_contract_to_system_address, block_and_receipts);
-            if block_num % 10000 == 0 || block_num == end_block {
+            process_block(
+                chain_id,
+                &mut state,
+                erc20_contract_to_system_address,
+                block_and_receipts,
+            );
+            if block_num % chunk_size == 0 || block_num == end_block {
                 let start = Instant::now();
                 let hash = state.blake3_hash_slow();
-                println!("Computed state hash after block={block_num}: {hash:?} in {:?}", start.elapsed());
+                println!(
+                    "Computed state hash after block={block_num}: {hash:?} in {:?}",
+                    start.elapsed()
+                );
+                if let Some(snapshot_dir) = &snapshot_dir {
+                    match snapshot_evm_state(
+                        block_num + 1,
+                        state.clone().into(),
+                        snapshot_dir.to_owned() + "/" + &block_num.to_string() + ".rmp",
+                    ) {
+                        Ok(_) => println!("Snapshot {block_num} succeeded"),
+                        Err(_) => println!("Snapshot {block_num} failed"),
+                    }
+                }
                 state_hash = Some(hash);
             }
         }
-        println!("Processed blocks {}-{} in {:?}", i, i + (chunk.len() as u64), start.elapsed());
+        println!(
+            "Processed blocks {}-{} in {:?}",
+            i,
+            i + (chunk.len() as u64),
+            start.elapsed()
+        );
     }
-    println!("Processed n={} blocks in {:?}", end_block - start_block + 1, start.elapsed());
+    println!(
+        "Processed n={} blocks in {:?}",
+        end_block - start_block + 1,
+        start.elapsed()
+    );
     state_hash.unwrap()
 }
 
@@ -279,7 +431,10 @@ const NON_PLACEHOLDER_BLOCK_HASH_HEIGHT: u64 = 243_538;
 
 #[allow(clippy::cast_possible_truncation)] // len(s) <= 31
 const fn encode_short_string(s: &str) -> U256 {
-    assert!(s.len() <= 31, "short string length must be at most 31 bytes");
+    assert!(
+        s.len() <= 31,
+        "short string length must be at most 31 bytes"
+    );
     let mut bytes = [0u8; 32];
     let s_bytes = s.as_bytes();
     let mut i = 0;
