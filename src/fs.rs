@@ -186,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn test_block_download() -> Result<()> {
         let time = Instant::now();
-        let max_block = download_blocks("~/hl-mainnet-evm-blocks", 4000000, 4001000).await?;
+        let max_block = download_blocks("hl-mainnet-evm-blocks", 4000000, 4001000).await?;
         println!("{:?} downloaded in {:?}", max_block, time.elapsed());
         Ok(())
     }
