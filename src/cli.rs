@@ -8,6 +8,7 @@ use crate::{
     run::{run_blocks, MAINNET_CHAIN_ID},
     state::State,
 };
+use anyhow::anyhow;
 
 const CHUNK_SIZE: u64 = 10000;
 
@@ -52,6 +53,12 @@ enum Commands {
         #[arg(short, long)]
         end_block: u64,
     },
+    GetNextBlockNumber {
+        #[arg(short, long)]
+        abci_state_fln: Option<String>,
+        #[arg(short, long)]
+        evm_state_fln: Option<String>,
+    },
 }
 
 impl Cli {
@@ -83,6 +90,18 @@ impl Cli {
                 end_block,
             } => {
                 run_from_state(blocks_dir, fln, false, snapshot_dir, chunk_size, end_block).await?
+            }
+            Commands::GetNextBlockNumber {
+                abci_state_fln,
+                evm_state_fln,
+            } => {
+                if let Some(fln) = abci_state_fln {
+                    println!("{}", read_abci_state(fln)?.0);
+                } else if let Some(fln) = evm_state_fln {
+                    println!("{}", read_evm_state(fln)?.0);
+                } else {
+                    return Err(anyhow!("No file specified"));
+                }
             }
         }
         Ok(())
