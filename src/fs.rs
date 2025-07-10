@@ -125,17 +125,11 @@ pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Res
             }
 
             let obj =
-                s3.get_object().bucket(bucket).key(key.clone()).request_payer(RequestPayer::Requester).send().await;
-
-            match obj {
-                Ok(obj) => {
-                    let mut body = obj.body.into_async_read();
-                    let mut file = tokio::fs::File::create(&local_path).await?;
-                    tokio::io::copy(&mut body, &mut file).await?;
-                    Ok(())
-                }
-                Err(err) => Err(err.into()),
-            }
+                s3.get_object().bucket(bucket).key(key.clone()).request_payer(RequestPayer::Requester).send().await?;
+            let mut body = obj.body.into_async_read();
+            let mut file = tokio::fs::File::create(&local_path).await?;
+            tokio::io::copy(&mut body, &mut file).await?;
+            Ok(())
         })
     }
     join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
@@ -155,7 +149,7 @@ mod tests {
     async fn test_block_download() -> Result<()> {
         let time = Instant::now();
         download_blocks("hl-mainnet-evm-blocks", 4000000, 4001000).await?;
-        println!("{:?} downloaded in {:?}", (), time.elapsed());
+        println!("downloaded in {:?}", time.elapsed());
         Ok(())
     }
 

@@ -16,7 +16,7 @@ use revm::{
     },
     Database, Evm,
 };
-use std::{collections::BTreeMap, fs::create_dir_all, path::Path, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 fn deploy_system_contract<S: State>(state: &mut S, contract_address: Address, deployed_bytecode: Bytes) {
     state.inject_contract(contract_address, deployed_bytecode);
@@ -249,9 +249,6 @@ where
     S: State + Into<EvmState> + Clone,
     <S as Database>::Error: std::fmt::Debug,
 {
-    if let Some(snapshot_dir) = &snapshot_dir {
-        create_dir_all(Path::new(snapshot_dir)).unwrap();
-    }
     let start_block = blocks.first().unwrap().1.first().unwrap().0;
     let end_block = blocks.last().unwrap().1.last().unwrap().0;
     let start = Instant::now();
@@ -271,10 +268,10 @@ where
                     match snapshot_evm_state(
                         block_num + 1,
                         &state.clone().into(),
-                        format!("{}/{}.rmp", snapshot_dir, block_num),
+                        format!("{snapshot_dir}/{block_num}.rmp"),
                     ) {
-                        Ok(_) => println!("Snapshot {block_num} succeeded"),
-                        Err(_) => println!("Snapshot {block_num} failed"),
+                        Ok(()) => println!("Snapshot {block_num} succeeded"),
+                        Err(e) => println!("Snapshot {block_num} failed: {e}"),
                     }
                 }
                 state_hash = Some(hash);
