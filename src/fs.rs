@@ -103,7 +103,7 @@ fn block_key(block_num: u64) -> String {
     format!("{f}/{s}/{block_num}.rmp.lz4")
 }
 
-pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Result<Option<u64>> {
+pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Result<()> {
     let region = RegionProviderChain::default_provider().or_else("us-east-1");
     let config = aws_config::defaults(BehaviorVersion::latest()).region(region).load().await;
     let s3 = Arc::new(Client::new(&config));
@@ -121,7 +121,7 @@ pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Res
             }
 
             if local_path.is_file() {
-                return Ok(Some(block_num));
+                return Ok(());
             }
 
             let obj =
@@ -132,25 +132,14 @@ pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Res
                     let mut body = obj.body.into_async_read();
                     let mut file = tokio::fs::File::create(&local_path).await?;
                     tokio::io::copy(&mut body, &mut file).await?;
-                    Ok(Some(block_num))
+                    Ok(())
                 }
-                Err(err) => {
-                    if let Some(s3_err) = err.as_service_error() {
-                        if s3_err.is_no_such_key() {
-                            Ok(None)
-                        } else {
-                            Err(err.into())
-                        }
-                    } else {
-                        Err(err.into())
-                    }
-                }
+                Err(err) => Err(err.into()),
             }
         })
     }
-    let results: Vec<Option<u64>> = join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
-    let max_block_num: Option<u64> = results.iter().filter_map(|&block_num| block_num).max();
-    Ok(max_block_num)
+    join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -165,8 +154,8 @@ mod tests {
     #[tokio::test]
     async fn test_block_download() -> Result<()> {
         let time = Instant::now();
-        let max_block = download_blocks("hl-mainnet-evm-blocks", 4000000, 4001000).await?;
-        println!("{:?} downloaded in {:?}", max_block, time.elapsed());
+        download_blocks("hl-mainnet-evm-blocks", 4000000, 4001000).await?;
+        println!("{:?} downloaded in {:?}", (), time.elapsed());
         Ok(())
     }
 

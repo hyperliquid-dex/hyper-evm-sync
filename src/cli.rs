@@ -55,11 +55,8 @@ impl Cli {
     pub async fn execute(self) -> Result<()> {
         match self.commands {
             Commands::DownloadBlocks { start_block, end_block, dir } => {
-                let max_block = download_blocks(&dir, start_block, end_block).await?;
-                match max_block {
-                    Some(block_num) => println!("Downloaded {start_block} -> {block_num}."),
-                    None => println!("Blocks do not exist yet"),
-                };
+                download_blocks(&dir, start_block, end_block).await?;
+                println!("Downloaded {start_block} -> {end_block}.");
             }
             Commands::SyncFromState { fln, is_abci, snapshot_dir, chunk_size, blocks_dir, end_block } => {
                 run_from_state(blocks_dir, fln, is_abci, snapshot_dir, chunk_size, end_block).await?
