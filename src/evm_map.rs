@@ -28,11 +28,7 @@ async fn fetch_spot_meta(chain_id: u64) -> Result<SpotMeta> {
         _ => return Err(Error::msg("unknown chain id")),
     };
     let client = reqwest::Client::new();
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({"type": "spotMeta"}))
-        .send()
-        .await?;
+    let response = client.post(url).json(&serde_json::json!({"type": "spotMeta"})).send().await?;
     Ok(response.json().await?)
 }
 

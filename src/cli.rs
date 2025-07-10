@@ -21,7 +21,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Download {
+    DownloadBlocks {
         #[arg(short, long)]
         dir: String,
         #[arg(short, long, default_value_t = 1)]
@@ -29,7 +29,9 @@ enum Commands {
         #[arg(short, long)]
         end_block: u64,
     },
-    SyncFromAbciState {
+    SyncFromState {
+        #[arg(long)]
+        is_abci: bool,
         #[arg(short, long)]
         blocks_dir: String,
         #[arg(short, long)]
@@ -41,19 +43,7 @@ enum Commands {
         #[arg(short, long)]
         end_block: u64,
     },
-    SyncFromEvmState {
-        #[arg(short, long)]
-        blocks_dir: String,
-        #[arg(short, long)]
-        fln: Option<String>,
-        #[arg(short, long)]
-        snapshot_dir: Option<String>,
-        #[arg(short, long, default_value_t = CHUNK_SIZE)]
-        chunk_size: u64,
-        #[arg(short, long)]
-        end_block: u64,
-    },
-    GetNextBlockNumber {
+    NextBlockNumber {
         #[arg(short, long)]
         abci_state_fln: Option<String>,
         #[arg(short, long)]
@@ -64,37 +54,17 @@ enum Commands {
 impl Cli {
     pub async fn execute(self) -> Result<()> {
         match self.commands {
-            Commands::Download {
-                start_block,
-                end_block,
-                dir,
-            } => {
+            Commands::DownloadBlocks { start_block, end_block, dir } => {
                 let max_block = download_blocks(&dir, start_block, end_block).await?;
                 match max_block {
                     Some(block_num) => println!("Downloaded {start_block} -> {block_num}."),
                     None => println!("Blocks do not exist yet"),
                 };
             }
-            Commands::SyncFromAbciState {
-                fln,
-                snapshot_dir,
-                chunk_size,
-                blocks_dir,
-                end_block,
-            } => run_from_state(blocks_dir, fln, true, snapshot_dir, chunk_size, end_block).await?,
-            Commands::SyncFromEvmState {
-                blocks_dir,
-                fln,
-                snapshot_dir,
-                chunk_size,
-                end_block,
-            } => {
-                run_from_state(blocks_dir, fln, false, snapshot_dir, chunk_size, end_block).await?
+            Commands::SyncFromState { fln, is_abci, snapshot_dir, chunk_size, blocks_dir, end_block } => {
+                run_from_state(blocks_dir, fln, is_abci, snapshot_dir, chunk_size, end_block).await?
             }
-            Commands::GetNextBlockNumber {
-                abci_state_fln,
-                evm_state_fln,
-            } => {
+            Commands::NextBlockNumber { abci_state_fln, evm_state_fln } => {
                 if let Some(fln) = abci_state_fln {
                     println!("{}", read_abci_state(fln)?.0);
                 } else if let Some(fln) = evm_state_fln {
@@ -116,8 +86,7 @@ async fn run_from_state(
     chunk_size: u64,
     end_block: u64,
 ) -> Result<()> {
-    let erc20_contract_to_system_address =
-        erc20_contract_to_system_address(MAINNET_CHAIN_ID).await?;
+    let erc20_contract_to_system_address = erc20_contract_to_system_address(MAINNET_CHAIN_ID).await?;
     let (start_block, state) = if let Some(state_fln) = state_fln {
         if is_abci {
             read_abci_state(state_fln)?
@@ -131,13 +100,6 @@ async fn run_from_state(
 
     let blocks = read_blocks(&blocks_dir, start_block, end_block, chunk_size);
 
-    run_blocks(
-        MAINNET_CHAIN_ID,
-        state,
-        blocks,
-        &erc20_contract_to_system_address,
-        snapshot_dir,
-        chunk_size,
-    );
+    run_blocks(MAINNET_CHAIN_ID, state, blocks, &erc20_contract_to_system_address, snapshot_dir, chunk_size);
     Ok(())
 }
