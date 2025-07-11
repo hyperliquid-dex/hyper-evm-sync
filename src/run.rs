@@ -239,7 +239,7 @@ fn process_block<S>(
 
 pub fn run_blocks<S>(
     chain_id: u64,
-    mut state: S,
+    state: &mut S,
     blocks: Vec<(u64, Vec<(u64, BlockAndReceipts)>)>,
     erc20_contract_to_system_address: &BTreeMap<Address, Address>,
     snapshot_dir: Option<String>,
@@ -259,7 +259,7 @@ where
         for &(block_num, ref block_and_receipts) in &chunk {
             let BlockAndReceipts { block: EvmBlock::Reth115(block), .. } = block_and_receipts;
             assert_eq!(block_num, block.number);
-            process_block(chain_id, &mut state, erc20_contract_to_system_address, block_and_receipts);
+            process_block(chain_id, state, erc20_contract_to_system_address, block_and_receipts);
             if block_num % chunk_size == 0 || block_num == end_block {
                 let start = Instant::now();
                 let hash = state.blake3_hash_slow();

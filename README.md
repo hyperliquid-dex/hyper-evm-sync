@@ -18,4 +18,4 @@ To run from a specific `EvmState` or `AbciState` (use `--is-abci` flag), use the
 
 `cargo run --release sync-from-state -b tmp/hl-mainnet-evm-blocks -e <ENDBLOCK> -f <STATEFLN>`
 
-To take snapshots as the command goes, add the `-s <SNAPSHOTDIR>` and `-c <CHUNKSIZE>` arguments. The former specifies which directory the snapshots go into and the latter specifies how often a snapshot is taken. The default chunk size is 10000.
+To take snapshots as the command goes, add the `-s <SNAPSHOTDIR>` and `-c <CHUNKSIZE>` arguments. The former specifies which directory the snapshots go into and the latter specifies how often a snapshot is taken. The default chunk size is 1000.

@@ -2,8 +2,8 @@ use crate::types::{AbciState, BlockAndReceipts, EvmState};
 use anyhow::Result;
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_s3::{types::RequestPayer, Client};
-use futures::future::join_all;
-use rayon::prelude::*;
+use futures::{stream, StreamExt, TryStreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use revm::InMemoryDB;
 use std::{
     fs::{create_dir_all, File},
@@ -12,6 +12,10 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use tokio::io::AsyncReadExt;
+
+const DOWNLOAD_CHUNK_SIZE: u64 = 10000;
+const CONCURRENCY_LIMIT: usize = 500;
 
 fn decompress(data: &[u8]) -> Result<Vec<u8>, lz4_flex::frame::Error> {
     let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
@@ -20,10 +24,10 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, lz4_flex::frame::Error> {
     Ok(decompressed)
 }
 
-fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
-    let mut file = File::open(file_path)?;
+async fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
+    let mut file = tokio::fs::File::open(&file_path).await?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    file.read_to_end(&mut buffer).await?;
 
     let buffer = decompress(&buffer)?;
 
@@ -32,7 +36,7 @@ fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
     Ok(input.pop().unwrap())
 }
 
-pub fn read_blocks(
+pub async fn read_blocks(
     dir: &str,
     start_block: u64,
     end_block: u64,
@@ -40,31 +44,30 @@ pub fn read_blocks(
 ) -> Vec<(u64, Vec<(u64, BlockAndReceipts)>)> {
     let start = Instant::now();
     let ranges: Vec<_> = (start_block..=end_block).step_by(usize::try_from(chunk_size).unwrap()).collect();
-    let blocks: Vec<_> = ranges
-        .into_par_iter()
-        .map(|chunk| {
-            let mut blocks: Vec<(_, BlockAndReceipts)> = Vec::new();
-            let start = Instant::now();
-            let start_block = chunk;
-            let end_block = (chunk + chunk_size - 1).min(end_block);
-            for block_num in start_block..=end_block {
+    let mut all_blocks = Vec::new();
+    for chunk in ranges {
+        let start = Instant::now();
+        let start_block = chunk;
+        let end_block = (chunk + chunk_size - 1).min(end_block);
+        let futures: Vec<_> = (start_block..=end_block)
+            .map(|block_num| async move {
                 let f = ((block_num - 1) / 1_000_000) * 1_000_000;
                 let s = ((block_num - 1) / 1_000) * 1_000;
                 let path = format!("{dir}/{f}/{s}/{block_num}.rmp.lz4");
                 let path = PathBuf::from(path);
-
                 let block_and_receipts = read_block_and_receipts(&path)
+                    .await
                     .inspect_err(|_| println!("failed to read block {block_num}"))
                     .unwrap();
-
-                blocks.push((block_num, block_and_receipts));
-            }
-            println!("Deserialized blocks {}-{} in {:?}", start_block, end_block, start.elapsed());
-            (chunk, blocks)
-        })
-        .collect();
+                (block_num, block_and_receipts)
+            })
+            .collect();
+        let blocks = stream::iter(futures).buffered(CONCURRENCY_LIMIT).collect().await;
+        println!("Deserialized blocks {}-{} in {:?}", start_block, end_block, start.elapsed());
+        all_blocks.push((chunk, blocks));
+    }
     println!("Deserialized n={end_block} blocks in {:?}", start.elapsed());
-    blocks
+    all_blocks
 }
 
 pub fn read_abci_state(fln: String) -> Result<(u64, InMemoryDB)> {
@@ -104,35 +107,55 @@ fn block_key(block_num: u64) -> String {
 }
 
 pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Result<()> {
+    let pb = ProgressBar::new(end_block - start_block + 1);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("##-"),
+    );
     let region = RegionProviderChain::default_provider().or_else("us-east-1");
     let config = aws_config::defaults(BehaviorVersion::latest()).region(region).load().await;
     let s3 = Arc::new(Client::new(&config));
 
     let bucket = "hl-mainnet-evm-blocks";
-    let mut futures = Vec::with_capacity((end_block - start_block + 1).try_into().unwrap());
-    for block_num in start_block..=end_block {
-        let local_path = PathBuf::from(dir);
-        let s3 = s3.clone();
-        futures.push(async move {
-            let key = block_key(block_num);
-            let local_path: PathBuf = local_path.clone().join(&key);
-            if let Some(parent) = local_path.parent() {
-                create_dir_all(parent)?;
-            }
+    let mut cur_block = start_block;
+    while cur_block <= end_block {
+        let next_block = (end_block + 1).min(cur_block + DOWNLOAD_CHUNK_SIZE);
+        let mut futures = Vec::with_capacity((next_block - cur_block).try_into().unwrap());
+        for block_num in cur_block..next_block {
+            let local_path = PathBuf::from(dir);
+            let s3 = s3.clone();
+            let pb = pb.clone();
+            futures.push(async move {
+                let key = block_key(block_num);
+                let local_path: PathBuf = local_path.clone().join(&key);
+                if let Some(parent) = local_path.parent() {
+                    create_dir_all(parent)?;
+                }
 
-            if local_path.is_file() {
-                return Ok(());
-            }
+                if local_path.is_file() {
+                    pb.inc(1);
+                    return Ok::<(), anyhow::Error>(());
+                }
 
-            let obj =
-                s3.get_object().bucket(bucket).key(key.clone()).request_payer(RequestPayer::Requester).send().await?;
-            let mut body = obj.body.into_async_read();
-            let mut file = tokio::fs::File::create(&local_path).await?;
-            tokio::io::copy(&mut body, &mut file).await?;
-            Ok(())
-        })
+                let obj = s3
+                    .get_object()
+                    .bucket(bucket)
+                    .key(key.clone())
+                    .request_payer(RequestPayer::Requester)
+                    .send()
+                    .await?;
+                let mut body = obj.body.into_async_read();
+                let mut file = tokio::fs::File::create(&local_path).await?;
+                tokio::io::copy(&mut body, &mut file).await?;
+                pb.inc(1);
+                Ok(())
+            })
+        }
+        stream::iter(futures).buffer_unordered(CONCURRENCY_LIMIT).try_collect::<Vec<()>>().await?;
+        cur_block = next_block;
     }
-    join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
     Ok(())
 }
 
