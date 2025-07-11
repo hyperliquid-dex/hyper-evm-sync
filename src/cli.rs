@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::anyhow;
 
-// take snapshots thsi often
+// take snapshots this often (default)
 const CHUNK_SIZE: u64 = 1000;
 // only store this many blocks in memory
 const READ_LIMIT: u64 = 100000;
