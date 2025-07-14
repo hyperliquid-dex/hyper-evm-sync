@@ -10,6 +10,12 @@ use revm::{
 };
 use serde::{Deserialize, Serialize};
 
+pub struct PreprocessedBlock {
+    pub block_num: u64,
+    pub block_and_receipts: BlockAndReceipts,
+    pub signers: Vec<Address>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockAndReceipts {
     pub block: EvmBlock,

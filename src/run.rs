@@ -2,13 +2,16 @@ use crate::{
     fs::snapshot_evm_state,
     precompile::set_replay_precompiles,
     state::{State, StateHash},
-    types::{BlockAndReceipts, EvmBlock, EvmState, ReadPrecompileInput, ReadPrecompileResult, SystemTx},
+    types::{
+        BlockAndReceipts, EvmBlock, EvmState, PreprocessedBlock, ReadPrecompileInput, ReadPrecompileResult, SystemTx,
+    },
 };
 use alloy::{
     consensus::Transaction as _,
     primitives::{address, bytes, Address, Bytes, B256, U256},
 };
-use reth_primitives::{transaction::SignedTransactionIntoRecoveredExt, Receipt, SealedBlock, Transaction};
+use indicatif::ProgressBar;
+use reth_primitives::{Receipt, SealedBlock, Transaction};
 use revm::{
     primitives::{
         Account, BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, HandlerCfg, HashMap,
@@ -156,6 +159,7 @@ fn process_block<S>(
     state: &mut S,
     erc20_contract_to_system_address: &BTreeMap<Address, Address>,
     block_and_receipts: &BlockAndReceipts,
+    signers: Vec<Address>,
 ) where
     S: State,
     <S as Database>::Error: std::fmt::Debug,
@@ -212,15 +216,15 @@ fn process_block<S>(
 
     let mut cumulative_gas_used = 0;
     let mut computed_receipts = Vec::new();
-    for (tx_index, tx_signed) in block.body().transactions.iter().enumerate() {
-        let (tx_signed, signer) = tx_signed.clone().try_into_ecrecovered().unwrap().into_parts();
-        let transaction = tx_signed.transaction;
+    let txs: Vec<_> = block.body().transactions.iter().zip(signers.iter()).enumerate().collect();
+    for (tx_index, (tx_signed, signer)) in txs {
+        let transaction = &tx_signed.transaction;
         let receipt = apply_tx(ApplyTxArgs {
             chain_id,
             block,
             precompile_results: &precompile_results,
-            sender: signer,
-            transaction: &transaction,
+            sender: *signer,
+            transaction,
             tx_index,
             is_system_tx: false,
             cumulative_gas_used,
@@ -237,10 +241,12 @@ fn process_block<S>(
     assert_eq!(expected_receipts, computed_receipts);
 }
 
+#[allow(clippy::type_complexity)]
 pub fn run_blocks<S>(
+    pb: Option<ProgressBar>,
     chain_id: u64,
     state: &mut S,
-    blocks: Vec<(u64, Vec<(u64, BlockAndReceipts)>)>,
+    blocks: Vec<(u64, Vec<PreprocessedBlock>)>,
     erc20_contract_to_system_address: &BTreeMap<Address, Address>,
     snapshot_dir: Option<String>,
     chunk_size: u64,
@@ -249,17 +255,21 @@ where
     S: State + Into<EvmState> + Clone,
     <S as Database>::Error: std::fmt::Debug,
 {
-    let start_block = blocks.first().unwrap().1.first().unwrap().0;
-    let end_block = blocks.last().unwrap().1.last().unwrap().0;
+    let start_block = blocks.first().unwrap().1.first().unwrap().block_num;
+    let end_block = blocks.last().unwrap().1.last().unwrap().block_num;
     let start = Instant::now();
     let mut state_hash = None;
     for (i, chunk) in blocks {
         println!("{i}");
         let start = Instant::now();
-        for &(block_num, ref block_and_receipts) in &chunk {
+        let chunk_len = chunk.len();
+        for PreprocessedBlock { block_num, ref block_and_receipts, signers } in chunk {
+            if let Some(pb) = pb.as_ref() {
+                pb.inc(1)
+            }
             let BlockAndReceipts { block: EvmBlock::Reth115(block), .. } = block_and_receipts;
             assert_eq!(block_num, block.number);
-            process_block(chain_id, state, erc20_contract_to_system_address, block_and_receipts);
+            process_block(chain_id, state, erc20_contract_to_system_address, block_and_receipts, signers);
             if block_num % chunk_size == 0 || block_num == end_block {
                 let start = Instant::now();
                 let hash = state.blake3_hash_slow();
@@ -277,7 +287,7 @@ where
                 state_hash = Some(hash);
             }
         }
-        println!("Processed blocks {}-{} in {:?}", i, i + (chunk.len() as u64), start.elapsed());
+        println!("Processed blocks {}-{} in {:?}", i, i + (chunk_len as u64), start.elapsed());
     }
     println!("Processed n={} blocks in {:?}", end_block - start_block + 1, start.elapsed());
     state_hash.unwrap()

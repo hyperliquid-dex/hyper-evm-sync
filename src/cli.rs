@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use revm::InMemoryDB;
 use tokio::sync::mpsc;
 
@@ -8,7 +9,7 @@ use crate::{
     fs::{download_blocks, read_abci_state, read_blocks, read_evm_state},
     run::{run_blocks, MAINNET_CHAIN_ID},
     state::State,
-    types::BlockAndReceipts,
+    types::PreprocessedBlock,
 };
 use anyhow::anyhow;
 
@@ -99,14 +100,20 @@ async fn run_from_state(
         (1, InMemoryDB::genesis())
     };
     println!("{start_block} -> {end_block}");
-
-    let (tx, mut rx) = mpsc::channel::<Vec<(u64, Vec<(u64, BlockAndReceipts)>)>>(2);
+    let pb = ProgressBar::new(end_block - start_block + 1);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    let (tx, mut rx) = mpsc::channel::<Vec<(u64, Vec<PreprocessedBlock>)>>(1);
 
     let reader = tokio::spawn(async move {
         let mut cur_block = start_block;
         while cur_block <= end_block {
             let last_block_in_chunk = end_block.min(cur_block + READ_LIMIT - 1);
-            let blocks = read_blocks(&blocks_dir, cur_block, last_block_in_chunk, chunk_size).await;
+            let blocks = read_blocks(&blocks_dir, cur_block, last_block_in_chunk, chunk_size);
             tx.send(blocks).await.unwrap();
             cur_block = last_block_in_chunk + 1;
         }
@@ -115,6 +122,7 @@ async fn run_from_state(
     let processor = tokio::spawn(async move {
         while let Some(blocks) = rx.recv().await {
             run_blocks(
+                Some(pb.clone()),
                 MAINNET_CHAIN_ID,
                 &mut state,
                 blocks,

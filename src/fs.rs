@@ -1,9 +1,12 @@
-use crate::types::{AbciState, BlockAndReceipts, EvmState};
+use crate::types::{AbciState, BlockAndReceipts, EvmBlock, EvmState, PreprocessedBlock};
 use anyhow::Result;
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_s3::{types::RequestPayer, Client};
 use futures::{stream, StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use itertools::Itertools;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use reth_primitives::transaction::SignedTransactionIntoRecoveredExt;
 use revm::InMemoryDB;
 use std::{
     fs::{create_dir_all, File},
@@ -12,7 +15,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::io::AsyncReadExt;
 
 const DOWNLOAD_CHUNK_SIZE: u64 = 10000;
 const CONCURRENCY_LIMIT: usize = 500;
@@ -24,10 +26,10 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, lz4_flex::frame::Error> {
     Ok(decompressed)
 }
 
-async fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
-    let mut file = tokio::fs::File::open(&file_path).await?;
+fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
+    let mut file = File::open(file_path)?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).await?;
+    file.read_to_end(&mut buffer)?;
 
     let buffer = decompress(&buffer)?;
 
@@ -36,12 +38,7 @@ async fn read_block_and_receipts(file_path: &Path) -> Result<BlockAndReceipts> {
     Ok(input.pop().unwrap())
 }
 
-pub async fn read_blocks(
-    dir: &str,
-    start_block: u64,
-    end_block: u64,
-    chunk_size: u64,
-) -> Vec<(u64, Vec<(u64, BlockAndReceipts)>)> {
+pub fn read_blocks(dir: &str, start_block: u64, end_block: u64, chunk_size: u64) -> Vec<(u64, Vec<PreprocessedBlock>)> {
     let start = Instant::now();
     let ranges: Vec<_> = (start_block..=end_block).step_by(usize::try_from(chunk_size).unwrap()).collect();
     let mut all_blocks = Vec::new();
@@ -49,24 +46,31 @@ pub async fn read_blocks(
         let start = Instant::now();
         let start_block = chunk;
         let end_block = (chunk + chunk_size - 1).min(end_block);
-        let futures: Vec<_> = (start_block..=end_block)
-            .map(|block_num| async move {
+        let blocks: Vec<_> = (start_block..=end_block)
+            .into_par_iter()
+            .map(|block_num| {
                 let f = ((block_num - 1) / 1_000_000) * 1_000_000;
                 let s = ((block_num - 1) / 1_000) * 1_000;
                 let path = format!("{dir}/{f}/{s}/{block_num}.rmp.lz4");
                 let path = PathBuf::from(path);
                 let block_and_receipts = read_block_and_receipts(&path)
-                    .await
                     .inspect_err(|_| println!("failed to read block {block_num}"))
                     .unwrap();
-                (block_num, block_and_receipts)
+                let BlockAndReceipts { block: EvmBlock::Reth115(block), .. } = &block_and_receipts;
+                let signers = block
+                    .body()
+                    .transactions
+                    .iter()
+                    .map(|tx_signed| tx_signed.clone().try_into_ecrecovered().unwrap().into_parts().1)
+                    .collect_vec();
+                PreprocessedBlock { block_num, block_and_receipts, signers }
             })
             .collect();
-        let blocks = stream::iter(futures).buffered(CONCURRENCY_LIMIT).collect().await;
+        // let blocks = stream::iter(futures).buffered(CONCURRENCY_LIMIT).collect().await;
         println!("Deserialized blocks {}-{} in {:?}", start_block, end_block, start.elapsed());
         all_blocks.push((chunk, blocks));
     }
-    println!("Deserialized n={end_block} blocks in {:?}", start.elapsed());
+    println!("Deserialized n={} blocks in {:?}", end_block - start_block + 1, start.elapsed());
     all_blocks
 }
 
