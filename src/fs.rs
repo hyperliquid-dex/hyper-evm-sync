@@ -133,7 +133,7 @@ pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Res
             let pb = pb.clone();
             futures.push(async move {
                 let key = block_key(block_num);
-                let local_path: PathBuf = local_path.clone().join(&key);
+                let local_path: PathBuf = local_path.join(&key);
                 if let Some(parent) = local_path.parent() {
                     create_dir_all(parent)?;
                 }
@@ -143,13 +143,7 @@ pub async fn download_blocks(dir: &str, start_block: u64, end_block: u64) -> Res
                     return Ok::<(), anyhow::Error>(());
                 }
 
-                let obj = s3
-                    .get_object()
-                    .bucket(bucket)
-                    .key(key.clone())
-                    .request_payer(RequestPayer::Requester)
-                    .send()
-                    .await?;
+                let obj = s3.get_object().bucket(bucket).key(key).request_payer(RequestPayer::Requester).send().await?;
                 let mut body = obj.body.into_async_read();
                 let mut file = tokio::fs::File::create(&local_path).await?;
                 tokio::io::copy(&mut body, &mut file).await?;

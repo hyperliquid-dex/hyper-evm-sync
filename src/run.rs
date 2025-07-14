@@ -191,7 +191,7 @@ fn process_block<S>(
     }
 
     let mut cumulative_gas_used = 0;
-    for (tx_index, system_tx) in system_txs.iter().enumerate() {
+    for (tx_index, system_tx) in system_txs.into_iter().enumerate() {
         let SystemTx { tx, receipt } = system_tx;
         let computed_receipt = apply_tx(ApplyTxArgs {
             chain_id,
@@ -202,7 +202,7 @@ fn process_block<S>(
             } else {
                 erc20_contract_to_system_address[&tx.to().unwrap()]
             },
-            transaction: tx,
+            transaction: &tx,
             tx_index,
             is_system_tx: true,
             cumulative_gas_used,
@@ -210,7 +210,7 @@ fn process_block<S>(
         });
         cumulative_gas_used = computed_receipt.cumulative_gas_used;
         if let Some(receipt) = receipt {
-            assert_eq!(computed_receipt, receipt.clone().into());
+            assert_eq!(computed_receipt, receipt.into());
         }
     }
 
