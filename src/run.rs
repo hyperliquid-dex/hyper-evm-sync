@@ -88,13 +88,13 @@ where
     let ApplyTxArgs {
         chain_id,
         block,
-        precompile_results,
         sender,
         transaction,
         tx_index,
         is_system_tx,
         mut cumulative_gas_used,
         mut db,
+        precompile_results,
     } = args;
     let mut cfg = CfgEnvWithHandlerCfg::new(CfgEnv::default().with_chain_id(chain_id), HandlerCfg::new(SpecId::CANCUN));
     let basefee = if is_system_tx {
@@ -158,7 +158,7 @@ fn process_block<S>(
     chain_id: u64,
     state: &mut S,
     erc20_contract_to_system_address: &BTreeMap<Address, Address>,
-    block_and_receipts: &BlockAndReceipts,
+    block_and_receipts: BlockAndReceipts,
     signers: Vec<Address>,
 ) where
     S: State,
@@ -168,8 +168,8 @@ fn process_block<S>(
     let EvmBlock::Reth115(block) = block;
     let precompile_results = Arc::new(
         read_precompile_calls
-            .iter()
-            .map(|(address, calls)| (*address, Arc::new(calls.iter().cloned().collect())))
+            .into_iter()
+            .map(|(address, calls)| (address, Arc::new(calls.into_iter().collect())))
             .collect(),
     );
 
@@ -195,7 +195,7 @@ fn process_block<S>(
         let SystemTx { tx, receipt } = system_tx;
         let computed_receipt = apply_tx(ApplyTxArgs {
             chain_id,
-            block,
+            block: &block,
             precompile_results: &precompile_results,
             sender: if tx.input().is_empty() {
                 NATIVE_TOKEN_SYSTEM_ADDRESS
@@ -221,7 +221,7 @@ fn process_block<S>(
         let transaction = &tx_signed.transaction;
         let receipt = apply_tx(ApplyTxArgs {
             chain_id,
-            block,
+            block: &block,
             precompile_results: &precompile_results,
             sender: *signer,
             transaction,
@@ -237,7 +237,7 @@ fn process_block<S>(
     if block.header().number >= NON_PLACEHOLDER_BLOCK_HASH_HEIGHT {
         state.insert_block_hash(block.number, block.hash());
     }
-    let expected_receipts: Vec<Receipt> = receipts.iter().cloned().map(Into::into).collect();
+    let expected_receipts: Vec<Receipt> = receipts.into_iter().map(Into::into).collect();
     assert_eq!(expected_receipts, computed_receipts);
 }
 
@@ -263,11 +263,11 @@ where
         println!("{i}");
         let start = Instant::now();
         let chunk_len = chunk.len();
-        for PreprocessedBlock { block_num, ref block_and_receipts, signers } in chunk {
+        for PreprocessedBlock { block_num, block_and_receipts, signers } in chunk {
             if let Some(pb) = pb.as_ref() {
                 pb.inc(1)
             }
-            let BlockAndReceipts { block: EvmBlock::Reth115(block), .. } = block_and_receipts;
+            let BlockAndReceipts { block: EvmBlock::Reth115(block), .. } = &block_and_receipts;
             assert_eq!(block_num, block.number);
             process_block(chain_id, state, erc20_contract_to_system_address, block_and_receipts, signers);
             if block_num % chunk_size == 0 || block_num == end_block {
