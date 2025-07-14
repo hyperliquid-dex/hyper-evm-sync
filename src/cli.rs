@@ -109,16 +109,6 @@ async fn run_from_state(
     );
     let (tx, mut rx) = mpsc::channel::<Vec<(u64, Vec<PreprocessedBlock>)>>(1);
 
-    let reader = tokio::spawn(async move {
-        let mut cur_block = start_block;
-        while cur_block <= end_block {
-            let last_block_in_chunk = end_block.min(cur_block + READ_LIMIT - 1);
-            let blocks = read_blocks(&blocks_dir, cur_block, last_block_in_chunk, chunk_size);
-            tx.send(blocks).await.unwrap();
-            cur_block = last_block_in_chunk + 1;
-        }
-    });
-
     let processor = tokio::spawn(async move {
         while let Some(blocks) = rx.recv().await {
             run_blocks(
@@ -132,6 +122,18 @@ async fn run_from_state(
             );
         }
     });
-    let _ = tokio::join!(reader, processor);
+
+    let reader = tokio::spawn(async move {
+        let mut cur_block = start_block;
+        while cur_block <= end_block {
+            let last_block_in_chunk = end_block.min(cur_block + READ_LIMIT - 1);
+            let blocks = read_blocks(&blocks_dir, cur_block, last_block_in_chunk, chunk_size);
+            tx.send(blocks).await.unwrap();
+            tokio::task::yield_now().await;
+            cur_block = last_block_in_chunk + 1;
+        }
+    });
+
+    let _ = tokio::join!(processor, reader);
     Ok(())
 }
