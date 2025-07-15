@@ -110,13 +110,7 @@ fn block_key(block_num: u64) -> String {
     format!("{f}/{s}/{block_num}.rmp.lz4")
 }
 
-async fn fetch_block(
-    block_num: u64,
-    dir: PathBuf,
-    s3: Arc<Client>,
-    pb: ProgressBar,
-    bucket: &str,
-) -> Result<(), anyhow::Error> {
+async fn fetch_block(block_num: u64, dir: PathBuf, s3: Arc<Client>, pb: ProgressBar, bucket: &str) -> Result<()> {
     let key = block_key(block_num);
     let local_path: PathBuf = dir.join(&key);
 

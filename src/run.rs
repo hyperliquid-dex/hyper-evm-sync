@@ -11,6 +11,7 @@ use alloy::{
     primitives::{address, bytes, Address, Bytes, B256, U160, U256},
 };
 use indicatif::ProgressBar;
+use itertools::Itertools;
 use reth_primitives::{Receipt, SealedBlock, Transaction};
 use revm::{
     primitives::{
@@ -195,16 +196,18 @@ fn process_block<S>(
             .into_iter()
             .map(|(address, calls)| (address, Arc::new(calls.into_iter().collect())))
             .collect();
-        let highest_precompile_address =
-            highest_precompile_address.unwrap_or(address!("0x000000000000000000000000000000000000080d"));
-        let mut i = 0x800;
-        loop {
-            let address = Address::from(U160::from(i));
-            if address > highest_precompile_address {
-                break;
+        if block.number >= WARM_PRECOMPILES_BLOCK_NUMBER {
+            let highest_precompile_address =
+                highest_precompile_address.unwrap_or(address!("0x000000000000000000000000000000000000080d"));
+            let mut i = 0x800;
+            loop {
+                let address = Address::from(U160::from(i));
+                if address > highest_precompile_address {
+                    break;
+                }
+                res.entry(address).or_default();
+                i += 1;
             }
-            res.entry(address).or_default();
-            i += 1;
         }
         Arc::new(res)
     };
@@ -259,6 +262,13 @@ fn process_block<S>(
         state.insert_block_hash(block.number, block.hash());
     }
     let expected_receipts: Vec<Receipt> = receipts.into_iter().map(Into::into).collect();
+    if expected_receipts != computed_receipts {
+        println!("left: {:?}", expected_receipts);
+        println!("right: {:?}", computed_receipts);
+        println!("transactions: {:?}", block.body().transactions);
+        println!("hashes: {:?}", block.body().transactions.iter().map(|tx| tx.hash()).collect_vec());
+        panic!();
+    }
     assert_eq!(expected_receipts, computed_receipts);
 }
 
@@ -322,6 +332,7 @@ const CORE_WRITER_ADDRESS: Address = address!("0x3333333333333333333333333333333
 const WHYPE_CONTRACT_ADDRESS: Address = address!("0x5555555555555555555555555555555555555555");
 const NON_PLACEHOLDER_BLOCK_HASH_HEIGHT: u64 = 243_538;
 const CORE_WRITER_DEPLOY_BLOCK_NUMBER: u64 = 7_578_299;
+const WARM_PRECOMPILES_BLOCK_NUMBER: u64 = 8_197_684;
 
 #[allow(clippy::cast_possible_truncation)] // len(s) <= 31
 const fn encode_short_string(s: &str) -> U256 {
