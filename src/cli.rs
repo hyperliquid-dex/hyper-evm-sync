@@ -133,6 +133,12 @@ async fn run_from_state(
         }
     });
 
-    let _ = tokio::join!(processor, reader);
+    let (processor_res, reader_res) = tokio::join!(processor, reader);
+    if let Err(e) = processor_res {
+        eprintln!("Processor failed: {}", e);
+    }
+    if let Err(e) = reader_res {
+        eprintln!("Reader failed: {}", e);
+    }
     Ok(())
 }
