@@ -8,7 +8,7 @@ use crate::{
 };
 use alloy::{
     consensus::Transaction as _,
-    primitives::{address, bytes, Address, Bytes, B256, U256},
+    primitives::{address, bytes, Address, Bytes, B256, U160, U256},
 };
 use indicatif::ProgressBar;
 use reth_primitives::{Receipt, SealedBlock, Transaction};
@@ -164,14 +164,27 @@ fn process_block<S>(
     S: State,
     <S as Database>::Error: std::fmt::Debug,
 {
-    let BlockAndReceipts { block, receipts, system_txs, read_precompile_calls } = block_and_receipts;
+    let BlockAndReceipts { block, receipts, system_txs, read_precompile_calls, highest_precompile_address } =
+        block_and_receipts;
     let EvmBlock::Reth115(block) = block;
-    let precompile_results = Arc::new(
-        read_precompile_calls
+    let precompile_results = {
+        let mut res: HashMap<_, _> = read_precompile_calls
             .into_iter()
             .map(|(address, calls)| (address, Arc::new(calls.into_iter().collect())))
-            .collect(),
-    );
+            .collect();
+        let highest_precompile_address =
+            highest_precompile_address.unwrap_or(address!("0x000000000000000000000000000000000000080d"));
+        let mut i = 0x800;
+        loop {
+            let address = Address::from(U160::from(i));
+            if address > highest_precompile_address {
+                break;
+            }
+            res.entry(address).or_default();
+            i += 1;
+        }
+        Arc::new(res)
+    };
 
     if block.number == 1 {
         deploy_system_contract(

@@ -24,6 +24,7 @@ pub struct BlockAndReceipts {
     pub system_txs: Vec<SystemTx>,
     #[serde(default)]
     pub read_precompile_calls: Vec<(Address, Vec<(ReadPrecompileInput, ReadPrecompileResult)>)>,
+    pub highest_precompile_address: Option<Address>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
