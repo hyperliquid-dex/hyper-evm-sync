@@ -21,19 +21,19 @@ struct SpotMeta {
     tokens: Vec<SpotToken>,
 }
 
-async fn fetch_spot_meta(chain_id: u64) -> Result<SpotMeta> {
+fn fetch_spot_meta(chain_id: u64) -> Result<SpotMeta> {
     let url = match chain_id {
         MAINNET_CHAIN_ID => "https://api.hyperliquid.xyz/info",
         TESTNET_CHAIN_ID => "https://api.hyperliquid-testnet.xyz/info",
         _ => return Err(Error::msg("unknown chain id")),
     };
-    let client = reqwest::Client::new();
-    let response = client.post(url).json(&serde_json::json!({"type": "spotMeta"})).send().await?;
-    Ok(response.json().await?)
+    let client = reqwest::blocking::Client::new();
+    let response = client.post(url).json(&serde_json::json!({"type": "spotMeta"})).send()?;
+    Ok(response.json()?)
 }
 
-pub async fn erc20_contract_to_system_address(chain_id: u64) -> Result<BTreeMap<Address, Address>> {
-    let meta = fetch_spot_meta(chain_id).await?;
+pub fn erc20_contract_to_system_address(chain_id: u64) -> Result<BTreeMap<Address, Address>> {
+    let meta = fetch_spot_meta(chain_id)?;
     let mut map = BTreeMap::new();
     for token in &meta.tokens {
         if let Some(evm_contract) = &token.evm_contract {
