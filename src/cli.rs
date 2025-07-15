@@ -129,7 +129,6 @@ async fn run_from_state(
             let last_block_in_chunk = end_block.min(cur_block + READ_LIMIT - 1);
             let blocks = read_blocks(&blocks_dir, cur_block, last_block_in_chunk, chunk_size);
             tx.send(blocks).await.unwrap();
-            tokio::task::yield_now().await;
             cur_block = last_block_in_chunk + 1;
         }
     });

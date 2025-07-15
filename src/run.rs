@@ -304,7 +304,7 @@ where
                 state_hash = Some(hash);
             }
         }
-        println!("Processed blocks {}-{} in {:?}", i, i + (chunk_len as u64), start.elapsed());
+        println!("Processed blocks {}-{} in {:?}", i, i + (chunk_len as u64 - 1), start.elapsed());
     }
     println!("Processed n={} blocks in {:?}", end_block - start_block + 1, start.elapsed());
     state_hash.unwrap()
