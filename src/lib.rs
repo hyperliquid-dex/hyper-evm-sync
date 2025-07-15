@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod evm_map;
 pub mod fs;
 pub mod precompile;
